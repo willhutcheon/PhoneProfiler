@@ -1,0 +1,15 @@
+{
+  "profiles": {
+    "PhoneProfiler": {
+      "commandName": "Project",
+      "commandLineArgs": "--port 7126"
+    },
+    "Container (Dockerfile)": {
+      "commandName": "Docker",
+      "launchUrl": "{Scheme}://{ServiceHost}:{ServicePort}",
+      "containerRunArguments": "--init",
+      "httpPort": 32098,
+      "useSSL": false
+    }
+  }
+}
