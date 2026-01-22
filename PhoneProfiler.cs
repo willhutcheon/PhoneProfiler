@@ -13,32 +13,6 @@ using System.Threading.Tasks;
 
 namespace PhoneProfiler;
 
-public class PhoneProfiler
-{
-    private readonly ILogger<PhoneProfiler> _logger;
-
-    public PhoneProfiler(ILogger<PhoneProfiler> logger)
-    {
-        _logger = logger;
-    }
-
-    [Function("Function1")]
-    public IActionResult Run([HttpTrigger(AuthorizationLevel.Function, "get", "post")] HttpRequest req)
-    {
-        _logger.LogInformation("C# HTTP trigger function processed a request.");
-        return new OkObjectResult("Welcome to Azure Functions!");
-    }
-}
-
-
-
-
-
-
-
-
-
-
 public static class ClientCertValidator
 {
     public static X509Certificate2? GetClientCertificate(HttpRequestData req)
@@ -169,6 +143,225 @@ public class CheckPhoneUpdate
         resp.Headers.Add("Content-Type", "application/json");
         resp.Headers.Add("Content-Length", bytes.Length.ToString());
         // Write body
+        await resp.Body.WriteAsync(bytes, 0, bytes.Length);
+        return resp;
+    }
+}
+public class UploadPhoneProfile
+{
+    private readonly ILogger<UploadPhoneProfile> _logger;
+    public UploadPhoneProfile(ILogger<UploadPhoneProfile> logger)
+    {
+        _logger = logger;
+    }
+    [Function("UploadPhoneProfile")]
+    public async Task<HttpResponseData> Run([HttpTrigger(AuthorizationLevel.Anonymous, "post")] HttpRequestData req)
+    {
+        _logger.LogInformation("UploadPhoneProfile request received.");
+        // Certificate validation
+        var cert = ClientCertValidator.GetClientCertificate(req);
+        if (cert == null)
+        {
+            var resp = req.CreateResponse(HttpStatusCode.Unauthorized);
+            await resp.WriteStringAsync("Client certificate missing.");
+            return resp;
+        }
+        if (!ClientCertValidator.IsCertificateAllowed(cert, _logger))
+        {
+            var resp = req.CreateResponse(HttpStatusCode.Unauthorized);
+            await resp.WriteStringAsync("Invalid client certificate.");
+            return resp;
+        }
+        try
+        {
+            string body = await new StreamReader(req.Body).ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(body))
+                return await CreateJsonResponse(req, 1, "Empty request body", null);
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            // Required fields
+            string configSig = root.GetProperty("config_signature").GetString();
+            string configJson = root.GetProperty("config_json").GetString();
+            string surveySig = root.GetProperty("survey_signature").GetString();
+            string surveyJson = root.GetProperty("survey_json").GetString();
+            string scheduleSig = root.GetProperty("schedule_signature").GetString();
+            string scheduleJson = root.GetProperty("schedule_json").GetString();
+            using var conn = new SqlConnection(Environment.GetEnvironmentVariable("SqlConnectionString"));
+            await conn.OpenAsync();
+            using var cmd = new SqlCommand(@"
+                INSERT INTO tblPhoneProfiles (
+                    config_signature,
+                    config_json,
+                    survey_signature,
+                    survey_json,
+                    schedule_signature,
+                    schedule_json
+                )
+                VALUES (
+                    @config_signature,
+                    @config_json,
+                    @survey_signature,
+                    @survey_json,
+                    @schedule_signature,
+                    @schedule_json
+                )", conn);
+            cmd.Parameters.AddWithValue("@config_signature", configSig);
+            cmd.Parameters.AddWithValue("@config_json", configJson);
+            cmd.Parameters.AddWithValue("@survey_signature", surveySig);
+            cmd.Parameters.AddWithValue("@survey_json", surveyJson);
+            cmd.Parameters.AddWithValue("@schedule_signature", scheduleSig);
+            cmd.Parameters.AddWithValue("@schedule_json", scheduleJson);
+            await cmd.ExecuteNonQueryAsync();
+            return await CreateJsonResponse(req, 0, "", new
+            {
+                Message = "Profile stored successfully"
+            });
+        }
+        catch (JsonException)
+        {
+            return await CreateJsonResponse(req, 2, "Invalid JSON format", null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "UploadPhoneProfile failed.");
+            return await CreateJsonResponse(req, 3, "Server error", null);
+        }
+    }
+    private async Task<HttpResponseData> CreateJsonResponse(HttpRequestData req, int errorCode, string errorText, object response)
+    {
+        var resp = req.CreateResponse(HttpStatusCode.OK);
+        var payload = new
+        {
+            ErrorCode = errorCode,
+            ErrorText = errorText,
+            Response = response ?? new { }
+        };
+        string json = JsonSerializer.Serialize(payload);
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(json);
+        resp.Headers.Add("Content-Type", "application/json");
+        resp.Headers.Add("Content-Length", bytes.Length.ToString());
+        await resp.Body.WriteAsync(bytes, 0, bytes.Length);
+        return resp;
+    }
+}
+public class GetPhoneProfile
+{
+    private readonly ILogger<GetPhoneProfile> _logger;
+    public GetPhoneProfile(ILogger<GetPhoneProfile> logger)
+    {
+        _logger = logger;
+    }
+    [Function("GetPhoneProfile")]
+    public async Task<HttpResponseData> Run([HttpTrigger(AuthorizationLevel.Anonymous, "get")] HttpRequestData req)
+    {
+        _logger.LogInformation("GetPhoneProfile request received.");
+        // Certificate validation
+        var cert = ClientCertValidator.GetClientCertificate(req);
+        if (cert == null)
+        {
+            var resp = req.CreateResponse(HttpStatusCode.Unauthorized);
+            await resp.WriteStringAsync("Client certificate missing.");
+            return resp;
+        }
+        if (!ClientCertValidator.IsCertificateAllowed(cert, _logger))
+        {
+            var resp = req.CreateResponse(HttpStatusCode.Unauthorized);
+            await resp.WriteStringAsync("Invalid client certificate.");
+            return resp;
+        }
+        var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
+        string type = query["type"];
+        string serial = query["serial_number"];
+        string clientSignature = query["signature"];
+        if (string.IsNullOrWhiteSpace(type) ||
+            string.IsNullOrWhiteSpace(serial) ||
+            string.IsNullOrWhiteSpace(clientSignature))
+        {
+            return await CreateJsonResponse(req, 1, "Missing parameters", null);
+        }
+        string sigColumn, jsonColumn;
+        switch (type.ToLowerInvariant())
+        {
+            case "config":
+                sigColumn = "config_signature";
+                jsonColumn = "config_json";
+                break;
+            case "survey":
+                sigColumn = "survey_signature";
+                jsonColumn = "survey_json";
+                break;
+            case "schedule":
+                sigColumn = "schedule_signature";
+                jsonColumn = "schedule_json";
+                break;
+            default:
+                return await CreateJsonResponse(req, 2, "Invalid type", null);
+        }
+        try
+        {
+            using var conn = new SqlConnection(Environment.GetEnvironmentVariable("SqlConnectionString"));
+            await conn.OpenAsync();
+            // 1. Get profile_id from device
+            var deviceCmd = new SqlCommand(@"
+                        SELECT profile_id
+                        FROM tblPhoneDevices
+                        WHERE serial_number_hardware = @serial
+                    ", conn);
+            deviceCmd.Parameters.AddWithValue("@serial", serial);
+            var profileIdObj = await deviceCmd.ExecuteScalarAsync();
+            if (profileIdObj == null || profileIdObj == DBNull.Value)
+            {
+                return await CreateJsonResponse(req, 2, "No profile assigned", null);
+            }
+            int profileId = Convert.ToInt32(profileIdObj);
+            // 2. Load requested profile data
+            var profileCmd = new SqlCommand($@"
+                SELECT {sigColumn}, {jsonColumn}
+                FROM tblPhoneProfiles
+                WHERE id = @id
+                ", conn);
+            profileCmd.Parameters.AddWithValue("@id", profileId);
+            using var reader = await profileCmd.ExecuteReaderAsync();
+            if (!reader.Read())
+            {
+                return await CreateJsonResponse(req, 2, "Profile not found", null);
+            }
+            string storedSignature = reader[sigColumn]?.ToString();
+            string storedJson = reader[jsonColumn]?.ToString();
+            // 3. Signature comparison
+            if (string.Equals(clientSignature, storedSignature,
+                StringComparison.OrdinalIgnoreCase))
+            {
+                return await CreateJsonResponse(req, 0, "Up to date", null);
+            }
+            using var jsonDoc = JsonDocument.Parse(storedJson);
+            // 4. Return updated payload
+            return await CreateJsonResponse(req, 0, "", new
+            {
+                Type = type,
+                Signature = storedSignature,
+                Json = jsonDoc.RootElement
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "GetPhoneProfile failed.");
+            return await CreateJsonResponse(req, 3, "Server error", null);
+        }
+    }
+    private async Task<HttpResponseData> CreateJsonResponse(HttpRequestData req, int errorCode, string errorText, object response)
+    {
+        var resp = req.CreateResponse(HttpStatusCode.OK);
+        var payload = new
+        {
+            ErrorCode = errorCode,
+            ErrorText = errorText,
+            Response = response ?? new { }
+        };
+        string json = JsonSerializer.Serialize(payload);
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(json);
+        resp.Headers.Add("Content-Type", "application/json");
+        resp.Headers.Add("Content-Length", bytes.Length.ToString());
         await resp.Body.WriteAsync(bytes, 0, bytes.Length);
         return resp;
     }
