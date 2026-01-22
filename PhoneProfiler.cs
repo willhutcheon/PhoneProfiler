@@ -181,37 +181,21 @@ public class UploadPhoneProfile
             using var doc = JsonDocument.Parse(body);
             var root = doc.RootElement;
             // Required fields
-            string configSig = root.GetProperty("config_signature").GetString();
-            string configJson = root.GetProperty("config_json").GetString();
-            string surveySig = root.GetProperty("survey_signature").GetString();
-            string surveyJson = root.GetProperty("survey_json").GetString();
-            string scheduleSig = root.GetProperty("schedule_signature").GetString();
-            string scheduleJson = root.GetProperty("schedule_json").GetString();
+            string publishDataTo = root.GetProperty("publish_data_to").GetString();
+            string surveyDomain = root.GetProperty("survey_domain").GetString();
             using var conn = new SqlConnection(Environment.GetEnvironmentVariable("SqlConnectionString"));
             await conn.OpenAsync();
             using var cmd = new SqlCommand(@"
                 INSERT INTO tblPhoneProfiles (
-                    config_signature,
-                    config_json,
-                    survey_signature,
-                    survey_json,
-                    schedule_signature,
-                    schedule_json
+                    publish_data_to,
+                    survey_domain
                 )
                 VALUES (
-                    @config_signature,
-                    @config_json,
-                    @survey_signature,
-                    @survey_json,
-                    @schedule_signature,
-                    @schedule_json
+                    @publish_data_to,
+                    @survey_domain
                 )", conn);
-            cmd.Parameters.AddWithValue("@config_signature", configSig);
-            cmd.Parameters.AddWithValue("@config_json", configJson);
-            cmd.Parameters.AddWithValue("@survey_signature", surveySig);
-            cmd.Parameters.AddWithValue("@survey_json", surveyJson);
-            cmd.Parameters.AddWithValue("@schedule_signature", scheduleSig);
-            cmd.Parameters.AddWithValue("@schedule_json", scheduleJson);
+            cmd.Parameters.AddWithValue("@publish_data_to", publishDataTo);
+            cmd.Parameters.AddWithValue("@survey_domain", surveyDomain);
             await cmd.ExecuteNonQueryAsync();
             return await CreateJsonResponse(req, 0, "", new
             {
@@ -253,10 +237,12 @@ public class GetPhoneProfile
         _logger = logger;
     }
     [Function("GetPhoneProfile")]
-    public async Task<HttpResponseData> Run([HttpTrigger(AuthorizationLevel.Anonymous, "get")] HttpRequestData req)
+    public async Task<HttpResponseData> Run(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "get")]
+        HttpRequestData req)
     {
         _logger.LogInformation("GetPhoneProfile request received.");
-        // Certificate validation
+        // --- Client certificate validation ---
         var cert = ClientCertValidator.GetClientCertificate(req);
         if (cert == null)
         {
@@ -271,43 +257,21 @@ public class GetPhoneProfile
             return resp;
         }
         var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
-        string type = query["type"];
-        string serial = query["serial_number"];
+        string serial = query["serial"];
         string clientSignature = query["signature"];
-        if (string.IsNullOrWhiteSpace(type) ||
-            string.IsNullOrWhiteSpace(serial) ||
-            string.IsNullOrWhiteSpace(clientSignature))
+        if (string.IsNullOrWhiteSpace(serial))
         {
-            return await CreateJsonResponse(req, 1, "Missing parameters", null);
-        }
-        string sigColumn, jsonColumn;
-        switch (type.ToLowerInvariant())
-        {
-            case "config":
-                sigColumn = "config_signature";
-                jsonColumn = "config_json";
-                break;
-            case "survey":
-                sigColumn = "survey_signature";
-                jsonColumn = "survey_json";
-                break;
-            case "schedule":
-                sigColumn = "schedule_signature";
-                jsonColumn = "schedule_json";
-                break;
-            default:
-                return await CreateJsonResponse(req, 2, "Invalid type", null);
+            return await CreateJsonResponse(req, 1, "Missing serial parameter", null);
         }
         try
         {
             using var conn = new SqlConnection(Environment.GetEnvironmentVariable("SqlConnectionString"));
             await conn.OpenAsync();
-            // 1. Get profile_id from device
-            var deviceCmd = new SqlCommand(@"
-                        SELECT profile_id
-                        FROM tblPhoneDevices
-                        WHERE serial_number_hardware = @serial
-                    ", conn);
+            using var deviceCmd = new SqlCommand(@"
+                SELECT profile_id
+                FROM tblPhoneDevices
+                WHERE serial_number_hardware = @serial
+            ", conn);
             deviceCmd.Parameters.AddWithValue("@serial", serial);
             var profileIdObj = await deviceCmd.ExecuteScalarAsync();
             if (profileIdObj == null || profileIdObj == DBNull.Value)
@@ -315,33 +279,33 @@ public class GetPhoneProfile
                 return await CreateJsonResponse(req, 2, "No profile assigned", null);
             }
             int profileId = Convert.ToInt32(profileIdObj);
-            // 2. Load requested profile data
-            var profileCmd = new SqlCommand($@"
-                SELECT {sigColumn}, {jsonColumn}
+            using var profileCmd = new SqlCommand(@"
+                SELECT profile_json, profile_signature
                 FROM tblPhoneProfiles
-                WHERE id = @id
-                ", conn);
+                WHERE cme_id = @id
+            ", conn);
             profileCmd.Parameters.AddWithValue("@id", profileId);
             using var reader = await profileCmd.ExecuteReaderAsync();
-            if (!reader.Read())
+            if (!await reader.ReadAsync())
             {
                 return await CreateJsonResponse(req, 2, "Profile not found", null);
             }
-            string storedSignature = reader[sigColumn]?.ToString();
-            string storedJson = reader[jsonColumn]?.ToString();
-            // 3. Signature comparison
-            if (string.Equals(clientSignature, storedSignature,
-                StringComparison.OrdinalIgnoreCase))
+            string storedSignature = reader["profile_signature"]?.ToString();
+            string storedJson = reader["profile_json"]?.ToString();
+            if (string.IsNullOrWhiteSpace(storedJson) || string.IsNullOrWhiteSpace(storedSignature))
             {
+                return await CreateJsonResponse(req, 3, "Invalid profile data", null);
+            }
+            if (!string.IsNullOrWhiteSpace(clientSignature) && string.Equals(clientSignature, storedSignature, StringComparison.OrdinalIgnoreCase))
+            {
+                // Device already has latest profile
                 return await CreateJsonResponse(req, 0, "Up to date", null);
             }
             using var jsonDoc = JsonDocument.Parse(storedJson);
-            // 4. Return updated payload
             return await CreateJsonResponse(req, 0, "", new
             {
-                Type = type,
                 Signature = storedSignature,
-                Json = jsonDoc.RootElement
+                Profile = jsonDoc.RootElement
             });
         }
         catch (Exception ex)
