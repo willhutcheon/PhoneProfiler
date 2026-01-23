@@ -237,9 +237,7 @@ public class GetPhoneProfile
         _logger = logger;
     }
     [Function("GetPhoneProfile")]
-    public async Task<HttpResponseData> Run(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "get")]
-        HttpRequestData req)
+    public async Task<HttpResponseData> Run([HttpTrigger(AuthorizationLevel.Anonymous, "get")] HttpRequestData req)
     {
         _logger.LogInformation("GetPhoneProfile request received.");
         // --- Client certificate validation ---
@@ -257,9 +255,9 @@ public class GetPhoneProfile
             return resp;
         }
         var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
-        string serial = query["serial"];
+        string deviceId = query["serial"];      // maps to tblPhoneDevices.cme_id
         string clientSignature = query["signature"];
-        if (string.IsNullOrWhiteSpace(serial))
+        if (string.IsNullOrWhiteSpace(deviceId))
         {
             return await CreateJsonResponse(req, 1, "Missing serial parameter", null);
         }
@@ -268,37 +266,37 @@ public class GetPhoneProfile
             using var conn = new SqlConnection(Environment.GetEnvironmentVariable("SqlConnectionString"));
             await conn.OpenAsync();
             using var deviceCmd = new SqlCommand(@"
-                SELECT profile_id
+                SELECT company_id
                 FROM tblPhoneDevices
-                WHERE serial_number_hardware = @serial
+                WHERE cme_id = @deviceId
             ", conn);
-            deviceCmd.Parameters.AddWithValue("@serial", serial);
-            var profileIdObj = await deviceCmd.ExecuteScalarAsync();
-            if (profileIdObj == null || profileIdObj == DBNull.Value)
+            deviceCmd.Parameters.AddWithValue("@deviceId", deviceId);
+            var companyIdObj = await deviceCmd.ExecuteScalarAsync();
+            if (companyIdObj == null || companyIdObj == DBNull.Value)
             {
-                return await CreateJsonResponse(req, 2, "No profile assigned", null);
+                return await CreateJsonResponse(req, 2, "Device not registered", null);
             }
-            int profileId = Convert.ToInt32(profileIdObj);
+            string companyId = companyIdObj.ToString();
             using var profileCmd = new SqlCommand(@"
                 SELECT profile_json, profile_signature
                 FROM tblPhoneProfiles
-                WHERE cme_id = @id
+                WHERE company_id = @companyId
             ", conn);
-            profileCmd.Parameters.AddWithValue("@id", profileId);
+            profileCmd.Parameters.AddWithValue("@companyId", companyId);
             using var reader = await profileCmd.ExecuteReaderAsync();
             if (!await reader.ReadAsync())
             {
                 return await CreateJsonResponse(req, 2, "Profile not found", null);
             }
-            string storedSignature = reader["profile_signature"]?.ToString();
             string storedJson = reader["profile_json"]?.ToString();
-            if (string.IsNullOrWhiteSpace(storedJson) || string.IsNullOrWhiteSpace(storedSignature))
+            string storedSignature = reader["profile_signature"]?.ToString();
+            if (string.IsNullOrWhiteSpace(storedJson) ||
+                string.IsNullOrWhiteSpace(storedSignature))
             {
                 return await CreateJsonResponse(req, 3, "Invalid profile data", null);
             }
             if (!string.IsNullOrWhiteSpace(clientSignature) && string.Equals(clientSignature, storedSignature, StringComparison.OrdinalIgnoreCase))
             {
-                // Device already has latest profile
                 return await CreateJsonResponse(req, 0, "Up to date", null);
             }
             using var jsonDoc = JsonDocument.Parse(storedJson);
