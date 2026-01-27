@@ -42,7 +42,7 @@ public class GetPhoneProfile
             using var conn = new SqlConnection(Environment.GetEnvironmentVariable("SqlConnectionString"));
             await conn.OpenAsync();
             using var cmd = new SqlCommand(@"
-                SELECT profile_json, profile_signature
+                SELECT profile_json, profile_signature, db_connection_string
                 FROM tblPhoneProfiles
                 WHERE cme_id = @cme_id
             ", conn);
@@ -52,8 +52,12 @@ public class GetPhoneProfile
             {
                 return await HttpJson.WriteAsync(req, HttpStatusCode.OK, 2, "Profile not found", null);
             }
-            string profileJson = reader.GetString(0);
-            string profileSignature = reader.GetString(1);
+            string profileJson = reader.GetString(reader.GetOrdinal("profile_json"));
+            string profileSignature = reader.GetString(reader.GetOrdinal("profile_signature"));
+            string dbConnectionString = reader.IsDBNull(reader.GetOrdinal("db_connection_string"))
+                ? null
+                : reader.GetString(reader.GetOrdinal("db_connection_string"));
+            // If client signature matches, profile is up-to-date
             if (!string.IsNullOrWhiteSpace(clientSignature) && string.Equals(clientSignature, profileSignature, StringComparison.OrdinalIgnoreCase))
             {
                 return await HttpJson.WriteAsync(req, HttpStatusCode.OK, 0, "Up to date", null);
@@ -62,7 +66,8 @@ public class GetPhoneProfile
             return await HttpJson.WriteAsync(req, HttpStatusCode.OK, 0, "", new
             {
                 Signature = profileSignature,
-                Profile = jsonDoc.RootElement
+                Profile = jsonDoc.RootElement,
+                DbConnectionString = dbConnectionString
             });
         }
         catch (Exception ex)
@@ -94,6 +99,9 @@ public class UploadPhoneProfile
             string surveyDomain = root.GetProperty("survey_domain").GetString();
             string profileName = root.GetProperty("profile_name").GetString();
             string companyId = root.GetProperty("company_id").GetString();
+            string dbConnectionString = root.TryGetProperty("db_connection_string", out var dbProp)
+                ? dbProp.GetString()
+                : null;
             JsonElement profile = root.GetProperty("profile");
             string profileJson = profile.GetRawText();
             string signature = Convert.ToHexString(
@@ -112,7 +120,8 @@ public class UploadPhoneProfile
                         profile_json = @profile_json,
                         profile_signature = @profile_signature,
                         profile_name = @profile_name,
-                        company_id = @company_id
+                        company_id = @company_id,
+                        db_connection_string = @db_connection_string
                 WHEN NOT MATCHED THEN
                     INSERT (
                         cme_id,
@@ -121,7 +130,8 @@ public class UploadPhoneProfile
                         profile_json,
                         profile_signature,
                         profile_name,
-                        company_id
+                        company_id,
+                        db_connection_string
                     )
                     VALUES (
                         @cme_id,
@@ -130,7 +140,8 @@ public class UploadPhoneProfile
                         @profile_json,
                         @profile_signature,
                         @profile_name,
-                        @company_id
+                        @company_id,
+                        @db_connection_string
                     );
             ", conn);
             cmd.Parameters.AddWithValue("@cme_id", cmeId);
@@ -140,6 +151,7 @@ public class UploadPhoneProfile
             cmd.Parameters.AddWithValue("@profile_signature", signature);
             cmd.Parameters.AddWithValue("@profile_name", profileName);
             cmd.Parameters.AddWithValue("@company_id", companyId);
+            cmd.Parameters.AddWithValue("@db_connection_string", dbConnectionString ?? (object)DBNull.Value);
             await cmd.ExecuteNonQueryAsync();
             return await HttpJson.WriteAsync(req, HttpStatusCode.OK, 0, "", new { Signature = signature });
         }
@@ -150,53 +162,56 @@ public class UploadPhoneProfile
         }
     }
 }
-public class CheckPhoneUpdate
+public class CheckForProfileUpdate
 {
-    private readonly ILogger<CheckPhoneUpdate> _logger;
-    public CheckPhoneUpdate(ILogger<CheckPhoneUpdate> logger)
+    private readonly ILogger<CheckForProfileUpdate> _logger;
+    public CheckForProfileUpdate(ILogger<CheckForProfileUpdate> logger)
     {
         _logger = logger;
     }
-    [Function("CheckPhoneUpdate")]
+
+    [Function("CheckForProfileUpdate")]
     public async Task<HttpResponseData> Run([HttpTrigger(AuthorizationLevel.Anonymous, "get")] HttpRequestData req)
     {
         var query = System.Web.HttpUtility.ParseQueryString(req.Url.Query);
-        string serial = query["serialNumber"];
-        string phoneVersion = query["phoneVersion"];
-        if (string.IsNullOrWhiteSpace(serial) || string.IsNullOrWhiteSpace(phoneVersion))
-        {
-            return await HttpJson.WriteAsync(req, HttpStatusCode.OK, 1, "Missing parameters", null);
-        }
+        string cmeId = query["cme_id"];
+        string clientSignature = query["signature"];
+        if (string.IsNullOrWhiteSpace(cmeId))
+            return await HttpJson.WriteAsync(req, HttpStatusCode.OK, 1, "Missing cme_id", null);
         try
         {
             using var conn = new SqlConnection(Environment.GetEnvironmentVariable("SqlConnectionString"));
             await conn.OpenAsync();
             using var cmd = new SqlCommand(@"
-                SELECT phone_model, status, company_id, tags
-                FROM tblPhoneDevices
+                SELECT profile_json, profile_signature, db_connection_string
+                FROM tblPhoneProfiles
                 WHERE cme_id = @cme_id
             ", conn);
-            cmd.Parameters.AddWithValue("@cme_id", serial);
+            cmd.Parameters.Add("@cme_id", SqlDbType.VarChar, 20).Value = cmeId;
             using var reader = await cmd.ExecuteReaderAsync();
             if (!await reader.ReadAsync())
+                return await HttpJson.WriteAsync(req, HttpStatusCode.OK, 2, "Profile not found", null);
+            string profileJson = reader.GetString(reader.GetOrdinal("profile_json"));
+            string profileSignature = reader.GetString(reader.GetOrdinal("profile_signature"));
+            string dbConnectionString = reader.IsDBNull(reader.GetOrdinal("db_connection_string"))
+                ? null
+                : reader.GetString(reader.GetOrdinal("db_connection_string"));
+            if (!string.IsNullOrWhiteSpace(clientSignature) &&
+                string.Equals(clientSignature, profileSignature, StringComparison.OrdinalIgnoreCase))
             {
-                return await HttpJson.WriteAsync(req, HttpStatusCode.OK, 1, "Invalid cme_id", null);
+                return await HttpJson.WriteAsync(req, HttpStatusCode.OK, 0, "Up to date", null);
             }
-            string phoneModel = reader.GetString(0);
-            string status = reader.IsDBNull(1) ? null : reader.GetString(1);
-            string companyId = reader.IsDBNull(2) ? null : reader.GetString(2);
-            string tags = reader.IsDBNull(3) ? null : reader.GetString(3);
+            using var jsonDoc = JsonDocument.Parse(profileJson);
             return await HttpJson.WriteAsync(req, HttpStatusCode.OK, 0, "", new
             {
-                PhoneModel = phoneModel,
-                Status = status,
-                CompanyId = companyId,
-                Tags = tags
+                Signature = profileSignature,
+                Profile = jsonDoc.RootElement,
+                DbConnectionString = dbConnectionString
             });
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "CheckPhoneUpdate failed");
+            _logger.LogError(ex, "CheckForProfileUpdate failed");
             return await HttpJson.WriteAsync(req, HttpStatusCode.OK, 3, "Server error", null);
         }
     }
